@@ -1,129 +1,63 @@
-# cod-singlecyclecpu
-# 这是武汉大学计算机学院计算机组成与设计课程设计的一部分
-# RISC-V 单周期实现
-# Yili Gong
-# 2023.05
+# RISC-V 单周期CPU设计及其优化——未完工
 
-注意事项：
-1. regfile.v
-参考给你的regfile.v文件，修改你的寄存器实现，在寄存器值被修改时，输出修改它的指令地址、被修改的寄存器地址和被修改的值。
-这里分别是pc、wa3和wd3，替换成你的实现中的线或者值。
-务必保持格式不变！
+> 本教程旨在实现一个最简单的RISC-V架构单周期CPU，除CPU核心外，仅包含指令存储器和数据存储器。本单周期CPU基本实现了RISC-V 规定的RV32I基础指令集。
+>
+> 在此之前，你需要掌握的：
+>
+> 1. 熟悉单周期CPU的基本模块（model）和数据通路（datapath）
+> 2. 基本掌握了Verilog语言的编写
+> 3. 掌握modelsim或者vivado软件的编译、仿真、波形查看
 
-	// DO NOT CHANGE THIS display LINE!!!
-	// 不要修改下面这行display语句！！！
-	/**********************************************************************/
-    	$display("x%d = %h", wa3, wd3);
-	/**********************************************************************/
+## RISC-V 单周期CPU总体设计方案
 
-2. testbench.v
-testbench文件中的打印语句可以用于调试，但是正式提交评测时会使用服务器上的tb文件，其中是没有这些打印语句的
-务必保持tb文件中CPU模块的模块名和引脚名不变
-xgriscv：RISC-V CPU模块；clk：时钟；rstn：reset；pc：当前正在执行的指令的pc
+> 对于刚入门硬件电路编写的同学，需要明白硬件电路编写与软件编程的差异性：
+>
+> - 硬件电路不像软件，可以边写边加边改，硬件电路需要先设计好电路图，有总体方案后才能下手编写HDL。由于硬件电路环环相扣，修改一部分很容易“牵一发而动全身”，工作量巨大且十分考验程序员的细心程度（比如对于模块某一端口的更改需要检查所有与该模块相连的其他模块）。所以建议先设计总体方案，再下手编写
+> - 硬件电路的debug比软件更加困难，也更难以发现潜在的错误。硬件的debug主要靠编写测试平台程序（testbench），依靠输出的波形判断功能。
+>
+> 基于以上，对我们的单周期CPU做一个总体设计方案是十分必要的
 
-   // instantiation of xgriscv_sc
-   xgriscv_sc xgriscv(clk, rstn, pc);
+### 译码核心·控制信号的产生
 
-其他文件中的模块和引脚名可自定义
+单周期CPU的工作主要就是由五个模块构成：取指、译码、运算、访存、写回。其中译码阶段是我们设计CPU的重中之重，因为译码阶段是产生控制信号的关键，而对于控制信号的理解关乎到整个CPU设计。
 
-指令内存的存放指令的模块名也不能变
+我们查看RV32指令集，指令集中的指令主要分为以下几类：
 
-    // input instruction for simulation
-    $readmemh("riscv32_sim1.dat", xgriscv.U_imem.RAM);
+1.运算类：寄存器与寄存器、寄存器与立即数的**运算**，运算的结果**写回寄存器**
 
-testbench文件中下述语句是用来让仿真在执行完后停止，需要根据每个测试程序的大小进行调整，设置为最后一条指令的地址即可
+2.加载类：通过（**寄存器+立即数**）的方式指定地址，从指定地址加载值**写回寄存器**
 
-	if (pc == 32'h80000078) // set to the address of the last instruction
-    begin
+3.存储类：通过（**寄存器+立即数**）的方式指定地址，将寄存器的值**写入地址对应内存**
 
-    	$stop;
-    end
+4.分支类：通过两个寄存器的值判读分支条件，条件成立时将**立即数作为偏移地址**进行跳转
 
-## Getting started
+5.跳转类：跳转地址由立即数+PC或者寄存器+PC决定，将PC+4**写回另一个寄存器**
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+由此可以归结出我们的控制信号：
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- 控制ALU的第二个操作数是立即数还是寄存器（ALUsrc）
+- 是否写回寄存器（RegWrite）
+- 是否读取地址   (MemRead)
+- 是否分支          （Branch）
+- 是否跳转           （Jump）
+- 是否写入内存      （MemWrite）
+- 判断ALU的操作是什么（加、减移位）（PreALUop）
+- 判断写入寄存器的值是什么  （WriteBackSel）
 
-## Add your files
+### ALU核心·进一步细化ALU的操作
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+前面谈到，我们已经有了控制信号判断ALU的操作。但是这个控制信号是不够的。一方面，ALU的操作众多，如果把这些操作都包含进来会让控制信号位数过长，没有必要；另一方面，控制信号位数过短也会造成无法判断ALU的详细操作。所以我们需要进一步细化ALU的操作：
 
-```
-cd existing_repo
-git remote add origin https://gitlab.educg.net/yiligong/cod-singlecyclecpu.git
-git branch -M main
-git push -uf origin main
-```
+实际上，只有R-TYPE和I-TYPE会有比较复杂的计算操作，而对于地址计算和分支判断，无非只有以下几种
 
-## Integrate with your tools
+- **加法**——地址运算
+- **比较**——分支判断
 
-- [ ] [Set up project integrations](https://gitlab.educg.net/yiligong/cod-singlecyclecpu/-/settings/integrations)
+所以PreALUop实际上只需要2位，用于区分R-Type、I-Type、地址运算和分支判断即可。
 
-## Collaborate with your team
+更详尽的ALU判断只需要附上funct3和funct7，就可以进行详细的判断。
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Automatically merge when pipeline succeeds](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+### PC计算·复杂的分支和跳转指令
 
-## Test and Deploy
+由于分支指令和跳转指令的加入，下一条PC不一定是简单的PC+4。我们需要讨论PC改变的几种情况：
 
-Use the built-in continuous integration in GitLab.
-
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
